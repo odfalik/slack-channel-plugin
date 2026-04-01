@@ -52,6 +52,7 @@ logger = logging.getLogger("slack-channel")
 _session: ServerSession | None = None
 _slack_client: Any = None  # AsyncWebClient from bolt app
 _bot_user_id: str | None = None
+_pending_eyes: dict[str, str] = {}  # thread_ts → message_ts (messages with eyes to remove)
 _user_name_cache: dict[str, str] = {}
 
 CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
@@ -354,6 +355,17 @@ async def _handle_reply(args: dict) -> list[types.TextContent]:
         _save_threads()
         logger.info("Tracking thread %s in %s", owned_ts, channel)
 
+    # Auto-remove eyes reaction from the message we're responding to
+    effective_thread = thread_ts or ts
+    if effective_thread in _pending_eyes:
+        eyes_ts = _pending_eyes.pop(effective_thread)
+        try:
+            await _slack_client.reactions_remove(
+                channel=channel, timestamp=eyes_ts, name="eyes",
+            )
+        except Exception:
+            pass
+
     return [types.TextContent(type="text", text=f"Sent (ts={ts}, channel={channel})")]
 
 
@@ -585,6 +597,9 @@ async def _watch_event_bus() -> None:
                         await _slack_client.reactions_add(
                             channel=msg_channel, timestamp=msg_ts, name="eyes",
                         )
+                        # Track so reply() can auto-remove it
+                        effective_thread = thread_ts or msg_ts
+                        _pending_eyes[effective_thread] = msg_ts
                     except Exception:
                         pass
                 await _send_channel_notification(event)
@@ -703,8 +718,8 @@ async def _main() -> None:
                 "created and @mentions. Use the reply tool to send messages. "
                 "Threads are automatically tracked per conversation and survive "
                 "--resume. When you receive a channel notification, an eyes emoji "
-                "reaction is automatically added to the message. After you respond, "
-                "call remove_reaction to remove the eyes emoji."
+                "reaction is automatically added to the message and removed when "
+                "you reply in the thread."
             ),
         )
 
