@@ -82,7 +82,7 @@ def _get_ppid(pid: int) -> int:
     try:
         import subprocess
         result = subprocess.run(
-            ["ps", "-o", "ppid=", "-p", str(pid)],
+            ["/bin/ps", "-o", "ppid=", "-p", str(pid)],
             capture_output=True, text=True, timeout=2,
         )
         return int(result.stdout.strip())
