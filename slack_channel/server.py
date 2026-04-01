@@ -77,17 +77,36 @@ _conversation_id: str | None = None
 _owned_threads: dict[str, str] = {}  # thread_ts → channel
 
 
+def _get_ppid(pid: int) -> int:
+    """Get the parent PID of a process (macOS/Linux)."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["ps", "-o", "ppid=", "-p", str(pid)],
+            capture_output=True, text=True, timeout=2,
+        )
+        return int(result.stdout.strip())
+    except Exception:
+        return 0
+
+
 def _resolve_conversation_id() -> str | None:
     """Read the conversation ID written by the SessionStart hook.
 
-    The hook writes ~/.config/slack-channel/sessions/{pid}.json with the
-    conversation_id. Our parent PID is the Claude Code process.
+    The hook writes ~/.config/slack-channel/sessions/{claude-code-pid}.json.
+    We walk up the process tree (ppid → grandppid → ...) to find the matching
+    session file, since there may be intermediate processes (e.g. uv/uvx)
+    between Claude Code and us.
     """
-    ppid = os.getppid()
-    session_file = _SESSIONS_DIR / f"{ppid}.json"
-    try:
-        data = json.loads(session_file.read_text())
-        return data.get("conversation_id")
+    pid = os.getpid()
+    for _ in range(5):  # walk up at most 5 levels
+        pid = _get_ppid(pid)
+        if pid <= 1:
+            break
+        session_file = _SESSIONS_DIR / f"{pid}.json"
+        try:
+            data = json.loads(session_file.read_text())
+            return data.get("conversation_id")
     except (OSError, json.JSONDecodeError):
         return None
 

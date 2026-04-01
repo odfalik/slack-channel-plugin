@@ -1,6 +1,6 @@
 [project]
 name = "slack-channel-plugin"
-version = "0.1.1"
+version = "0.1.2"
 description = "Slack channel plugin for Claude Code — real-time messaging via Socket Mode"
 license = {text = "Apache-2.0"}
 requires-python = ">=3.10"
