@@ -533,6 +533,107 @@ async def _send_channel_notification(event: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Cold replies (leader only) — for messages no active session owns
+# ---------------------------------------------------------------------------
+
+NO_RESPONSE_SENTINEL = "NO_RESPONSE"
+REACT_PREFIX = "REACT:"
+
+
+async def _fetch_thread_context(channel: str, thread_ts: str) -> str:
+    """Fetch all messages in a thread and format as context."""
+    try:
+        result = await _slack_client.conversations_replies(
+            channel=channel, ts=thread_ts, limit=50,
+        )
+    except Exception:
+        return "(failed to fetch thread)"
+
+    lines = []
+    for msg in result.get("messages", []):
+        user = await _resolve_user(msg.get("user", ""))
+        text = msg.get("text", "")
+        lines.append(f"{user}: {text}")
+    return "\n".join(lines)
+
+
+async def _cold_reply(event: dict, channel: str, thread_ts: str, msg_ts: str) -> None:
+    """Spawn claude -p to respond to an unowned message."""
+    import subprocess as sp
+
+    sender = event.get("_sender_name", "someone")
+    logger.info("Cold reply: thread=%s sender=%s", thread_ts, sender)
+
+    # Add eyes reaction
+    try:
+        await _slack_client.reactions_add(channel=channel, timestamp=msg_ts, name="eyes")
+    except Exception:
+        pass
+
+    # Fetch thread context
+    context = await _fetch_thread_context(channel, thread_ts)
+
+    system_prompt = (
+        "You are a helpful AI assistant replying in a Slack thread. "
+        "Keep responses concise. "
+        "You have three response modes:\n"
+        f"1. If no response is needed — respond with exactly: {NO_RESPONSE_SENTINEL}\n"
+        f"2. If a simple emoji reaction is better — respond with: {REACT_PREFIX}<emoji_name> "
+        f"(e.g. REACT:thumbsup, REACT:white_check_mark)\n"
+        "3. Otherwise, respond normally with text.\n"
+        "Use your judgment — a thumbs-up is often better than a wordy acknowledgment."
+    )
+
+    full_prompt = f"{system_prompt}\n\n## Thread context\n{context}"
+
+    try:
+        result = sp.run(
+            ["claude", "-p", full_prompt, "--allowedTools", "Read", "Glob", "Grep"],
+            capture_output=True, text=True, timeout=300,
+        )
+        output = result.stdout.strip() or "(no response)"
+    except sp.TimeoutExpired:
+        output = "(timed out)"
+    except Exception as e:
+        output = f"(error: {e})"
+
+    # Remove eyes
+    try:
+        await _slack_client.reactions_remove(channel=channel, timestamp=msg_ts, name="eyes")
+    except Exception:
+        pass
+
+    # Handle response modes
+    stripped = output.strip()
+    if stripped == NO_RESPONSE_SENTINEL:
+        logger.info("Cold reply: no response needed for %s", thread_ts)
+        return
+
+    if stripped.startswith(REACT_PREFIX):
+        emoji = stripped[len(REACT_PREFIX):].strip()
+        logger.info("Cold reply: reacting with :%s: to %s", emoji, thread_ts)
+        try:
+            await _slack_client.reactions_add(channel=channel, timestamp=msg_ts, name=emoji)
+        except Exception:
+            pass
+        return
+
+    # Send text reply
+    try:
+        if len(output) <= 4000:
+            await _slack_client.chat_postMessage(
+                channel=channel, text=output, thread_ts=thread_ts,
+            )
+        else:
+            for i in range(0, len(output), 3900):
+                await _slack_client.chat_postMessage(
+                    channel=channel, text=output[i:i + 3900], thread_ts=thread_ts,
+                )
+    except Exception:
+        logger.error("Cold reply: failed to send response", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Event bus: leader writes, all instances read
 # ---------------------------------------------------------------------------
 
@@ -603,6 +704,15 @@ async def _watch_event_bus() -> None:
                     except Exception:
                         pass
                 await _send_channel_notification(event)
+            elif _is_leader:
+                # Unowned message — leader handles with cold claude -p reply
+                msg_ts = event.get("ts", "")
+                msg_channel = event.get("channel", "")
+                if msg_channel:
+                    import asyncio
+                    asyncio.get_event_loop().create_task(
+                        _cold_reply(event, msg_channel, thread_ts or msg_ts, msg_ts)
+                    )
 
 
 # ---------------------------------------------------------------------------
