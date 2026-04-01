@@ -683,14 +683,13 @@ async def _watch_event_bus() -> None:
                 continue
 
             thread_ts = event.get("thread_ts")
-            is_mention = _bot_user_id and f"<@{_bot_user_id}>" in event.get("text", "")
 
-            if (thread_ts and thread_ts in _owned_threads) or is_mention:
+            if thread_ts and thread_ts in _owned_threads:
+                # Reply to an owned thread → notify this session
                 logger.info(
                     "Event bus → notify: thread=%s sender=%s",
                     thread_ts, event.get("_sender_name", "?"),
                 )
-                # Add eyes reaction to show we're attending to the message
                 msg_ts = event.get("ts", "")
                 msg_channel = event.get("channel", "")
                 if msg_ts and msg_channel:
@@ -698,14 +697,12 @@ async def _watch_event_bus() -> None:
                         await _slack_client.reactions_add(
                             channel=msg_channel, timestamp=msg_ts, name="eyes",
                         )
-                        # Track so reply() can auto-remove it
-                        effective_thread = thread_ts or msg_ts
-                        _pending_eyes[effective_thread] = msg_ts
+                        _pending_eyes[thread_ts] = msg_ts
                     except Exception:
                         pass
                 await _send_channel_notification(event)
             elif _is_leader:
-                # Unowned message — leader handles with cold claude -p reply
+                # Unowned message (including @mentions, new threads) → cold reply
                 msg_ts = event.get("ts", "")
                 msg_channel = event.get("channel", "")
                 if msg_channel:
