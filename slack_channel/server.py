@@ -107,8 +107,9 @@ def _resolve_conversation_id() -> str | None:
         try:
             data = json.loads(session_file.read_text())
             return data.get("conversation_id")
-    except (OSError, json.JSONDecodeError):
-        return None
+        except (OSError, json.JSONDecodeError):
+            continue
+    return None
 
 
 def _ensure_conversation_id() -> str | None:
