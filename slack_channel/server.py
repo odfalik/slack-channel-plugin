@@ -233,6 +233,22 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="remove_reaction",
+            description="Remove an emoji reaction from a message",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "channel": {"type": "string", "description": "Channel ID"},
+                    "timestamp": {"type": "string", "description": "Message timestamp"},
+                    "reaction": {
+                        "type": "string",
+                        "description": "Emoji name without colons (e.g. eyes)",
+                    },
+                },
+                "required": ["channel", "timestamp", "reaction"],
+            },
+        ),
+        types.Tool(
             name="list_channels",
             description="List Slack channels the bot has access to",
             inputSchema={
@@ -282,6 +298,7 @@ async def call_tool(
     handlers = {
         "reply": _handle_reply,
         "add_reaction": _handle_add_reaction,
+        "remove_reaction": _handle_remove_reaction,
         "list_channels": _handle_list_channels,
         "read_history": _handle_read_history,
         "get_thread": _handle_get_thread,
@@ -327,6 +344,18 @@ async def _handle_add_reaction(args: dict) -> list[types.TextContent]:
         name=args["reaction"],
     )
     return [types.TextContent(type="text", text=f"Reacted :{args['reaction']}:")]
+
+
+async def _handle_remove_reaction(args: dict) -> list[types.TextContent]:
+    try:
+        await _slack_client.reactions_remove(
+            channel=args["channel"],
+            timestamp=args["timestamp"],
+            name=args["reaction"],
+        )
+    except Exception:
+        pass  # Ignore if reaction wasn't there
+    return [types.TextContent(type="text", text=f"Removed :{args['reaction']}:")]
 
 
 async def _handle_list_channels(args: dict) -> list[types.TextContent]:
@@ -528,6 +557,16 @@ async def _watch_event_bus() -> None:
                     "Event bus → notify: thread=%s sender=%s",
                     thread_ts, event.get("_sender_name", "?"),
                 )
+                # Add eyes reaction to show we're attending to the message
+                msg_ts = event.get("ts", "")
+                msg_channel = event.get("channel", "")
+                if msg_ts and msg_channel:
+                    try:
+                        await _slack_client.reactions_add(
+                            channel=msg_channel, timestamp=msg_ts, name="eyes",
+                        )
+                    except Exception:
+                        pass
                 await _send_channel_notification(event)
 
 
@@ -643,7 +682,9 @@ async def _main() -> None:
                 "emits notifications/claude/channel for replies to threads you "
                 "created and @mentions. Use the reply tool to send messages. "
                 "Threads are automatically tracked per conversation and survive "
-                "--resume."
+                "--resume. When you receive a channel notification, an eyes emoji "
+                "reaction is automatically added to the message. After you respond, "
+                "call remove_reaction to remove the eyes emoji."
             ),
         )
 
