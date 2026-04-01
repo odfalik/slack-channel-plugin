@@ -588,7 +588,19 @@ async def _cold_reply(event: dict, channel: str, thread_ts: str, msg_ts: str) ->
 
     try:
         result = sp.run(
-            ["claude", "-p", full_prompt, "--allowedTools", "Read", "Glob", "Grep"],
+            [
+                "claude", "-p", full_prompt,
+                "--allowedTools",
+                "Read", "Glob", "Grep",
+                "mcp__slack-channel__reply",
+                "mcp__slack-channel__get_thread",
+                "mcp__slack-channel__read_history",
+                "mcp__slack-channel__add_reaction",
+                "mcp__claude_ai_Google_Calendar__*",
+                "mcp__claude_ai_Gmail__*",
+                "mcp__claude_ai_Notion__*",
+                "mcp__claude_ai_Slack__*",
+            ],
             capture_output=True, text=True, timeout=300,
         )
         output = result.stdout.strip() or "(no response)"
