@@ -2,7 +2,7 @@
   "mcpServers": {
     "slack-channel": {
       "command": "uvx",
-      "args": ["slack-channel-plugin"]
+      "args": ["--from", "slack-channel-plugin", "slack-channel"]
     }
   }
 }
