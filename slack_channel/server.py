@@ -113,6 +113,28 @@ def _resolve_conversation_id() -> str | None:
     return None
 
 
+def _get_tmux_window() -> str | None:
+    """Get the current tmux window name by querying tmux live.
+
+    Uses $TMUX_PANE (inherited from the shell that spawned Claude Code)
+    to identify the correct pane, then asks tmux for its window name.
+    Resolved fresh each call so renames are picked up immediately.
+    """
+    pane = os.environ.get("TMUX_PANE")
+    if not pane:
+        return None
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{window_name}"],
+            capture_output=True, text=True, timeout=2,
+        )
+        name = result.stdout.strip()
+        return name or None
+    except Exception:
+        return None
+
+
 def _ensure_conversation_id() -> str | None:
     """Resolve and cache the conversation ID. Retries until found."""
     global _conversation_id
@@ -340,10 +362,17 @@ async def _handle_reply(args: dict) -> list[types.TextContent]:
     if not channel:
         return [types.TextContent(type="text", text="Error: no channel — set SLACK_CHANNEL_ID or pass channel")]
 
+    # Prefix message with tmux window name if available (so recipients
+    # know which agent/session sent the message).
+    text = args["text"]
+    tmux_window = _get_tmux_window()
+    if tmux_window:
+        text = f"[{tmux_window}] {text}"
+
     thread_ts = args.get("thread_ts")
     result = await _slack_client.chat_postMessage(
         channel=channel,
-        text=args["text"],
+        text=text,
         thread_ts=thread_ts,
     )
     ts = result.get("ts", "?")
