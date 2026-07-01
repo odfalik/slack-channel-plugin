@@ -508,14 +508,15 @@ async def _handle_debug(args: dict) -> list[types.TextContent]:
 # ---------------------------------------------------------------------------
 # File attachments → local cache so agents can view images on demand
 # ---------------------------------------------------------------------------
-# Images are downloaded to a durable cache dir (NOT /tmp, which macOS prunes)
-# and referenced by absolute path in the message text. The agent's own Read
-# tool loads them only when it actually wants to look — so image bytes never
-# bloat context on a routine history read. Requires the user token's files:read
-# scope; url_private downloads need an authenticated request.
+# Images are downloaded to a temp cache dir and referenced by absolute path in
+# the message text. The agent's own Read tool loads them only when it actually
+# wants to look — so image bytes never bloat context on a routine history read.
+# We use /tmp and don't manage retention: if the OS prunes an old file, a later
+# read just re-downloads it (fetch is keyed on cache-miss), so stale paths
+# self-heal. Requires the user token's files:read scope; url_private downloads
+# need an authenticated request.
 _IMAGE_CACHE_DIR = Path(
-    os.environ.get("SLACK_IMAGE_CACHE_DIR")
-    or (Path.home() / ".cache" / "golem-slack-images")
+    os.environ.get("SLACK_IMAGE_CACHE_DIR") or "/tmp/golem-slack-images"
 )
 
 
