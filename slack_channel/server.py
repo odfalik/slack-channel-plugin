@@ -50,7 +50,8 @@ logger = logging.getLogger("slack-channel")
 # Globals (set during startup)
 # ---------------------------------------------------------------------------
 _session: ServerSession | None = None
-_slack_client: Any = None  # AsyncWebClient from bolt app
+_slack_client: Any = None  # AsyncWebClient (bot token) — used for writes + notifications
+_read_client: Any = None   # AsyncWebClient (user xoxp token if set, else falls back to bot) — used for reads
 _bot_user_id: str | None = None
 _pending_eyes: dict[str, str] = {}  # thread_ts → message_ts (messages with eyes to remove)
 _user_name_cache: dict[str, str] = {}
@@ -293,7 +294,7 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="list_channels",
-            description="List Slack channels the bot has access to",
+            description="List Slack channels and DMs (public/private channels, group DMs, and direct messages). DMs appear as '@user  <id>  (DM)'.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -421,24 +422,28 @@ async def _handle_remove_reaction(args: dict) -> list[types.TextContent]:
 
 async def _handle_list_channels(args: dict) -> list[types.TextContent]:
     limit = args.get("limit", 100)
-    result = await _slack_client.conversations_list(
-        types="public_channel,private_channel",
+    result = await _read_client.conversations_list(
+        types="public_channel,private_channel,mpim,im",
         exclude_archived=True,
         limit=limit,
     )
     lines = []
     for ch in result.get("channels", []):
-        name = ch.get("name", "?")
         cid = ch["id"]
-        members = ch.get("num_members", "?")
-        lines.append(f"#{name}  {cid}  ({members} members)")
+        if ch.get("is_im"):
+            peer = await _resolve_user(ch.get("user", ""))
+            lines.append(f"@{peer}  {cid}  (DM)")
+        else:
+            name = ch.get("name", "?")
+            members = ch.get("num_members", "?")
+            lines.append(f"#{name}  {cid}  ({members} members)")
     return [types.TextContent(type="text", text="\n".join(lines) or "No channels found.")]
 
 
 async def _handle_read_history(args: dict) -> list[types.TextContent]:
     channel = args["channel"]
     limit = args.get("limit", 25)
-    result = await _slack_client.conversations_history(channel=channel, limit=limit)
+    result = await _read_client.conversations_history(channel=channel, limit=limit)
 
     lines = []
     for msg in reversed(result.get("messages", [])):
@@ -455,7 +460,7 @@ async def _handle_read_history(args: dict) -> list[types.TextContent]:
 async def _handle_get_thread(args: dict) -> list[types.TextContent]:
     channel = args["channel"]
     thread_ts = args["thread_ts"]
-    result = await _slack_client.conversations_replies(
+    result = await _read_client.conversations_replies(
         channel=channel, ts=thread_ts, limit=200,
     )
 
@@ -507,7 +512,7 @@ async def _resolve_user(user_id: str) -> str:
         _user_name_cache[user_id] = "(bot)"
         return "(bot)"
     try:
-        info = await _slack_client.users_info(user=user_id)
+        info = await _read_client.users_info(user=user_id)
         profile = info["user"]["profile"]
         name = profile.get("display_name") or info["user"].get("real_name") or user_id
         _user_name_cache[user_id] = name
@@ -816,7 +821,7 @@ async def _run_slack_listener(app: AsyncApp, app_token: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def _main() -> None:
-    global _session, _slack_client, _is_leader, _bot_user_id
+    global _session, _slack_client, _read_client, _is_leader, _bot_user_id
 
     logging.basicConfig(
         level=logging.INFO,
@@ -834,6 +839,16 @@ async def _main() -> None:
     # All instances need a Slack client for tools
     from slack_sdk.web.async_client import AsyncWebClient
     _slack_client = AsyncWebClient(token=bot_token)
+
+    # Reads (history, channels, DMs) use the user token if provided so they see
+    # everything Oded can see — including DMs the bot was never invited to.
+    # Writes/reactions/notifications stay on the bot token above (messages post as @Golem).
+    user_token = os.environ.get("SLACK_USER_TOKEN")
+    _read_client = AsyncWebClient(token=user_token) if user_token else _slack_client
+    if user_token:
+        logger.info("SLACK_USER_TOKEN set — reads use user (xoxp) token; writes use bot token")
+    else:
+        logger.info("SLACK_USER_TOKEN not set — reads fall back to bot token")
 
     # Resolve bot user ID (needed for filtering even in non-leader instances)
     try:
