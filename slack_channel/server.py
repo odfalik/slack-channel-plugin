@@ -17,8 +17,10 @@ import fcntl
 import json
 import logging
 import os
+import re
 import sys
 import time
+import urllib.request
 from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import Any
@@ -449,7 +451,7 @@ async def _handle_read_history(args: dict) -> list[types.TextContent]:
     for msg in reversed(result.get("messages", [])):
         user = await _resolve_user(msg.get("user", ""))
         ts = msg.get("ts", "")
-        text = msg.get("text", "")
+        text = msg.get("text", "") + await _file_annotations(msg)
         thread_indicator = ""
         if msg.get("reply_count"):
             thread_indicator = f" [{msg['reply_count']} replies]"
@@ -467,7 +469,7 @@ async def _handle_get_thread(args: dict) -> list[types.TextContent]:
     lines = []
     for msg in result.get("messages", []):
         user = await _resolve_user(msg.get("user", ""))
-        text = msg.get("text", "")
+        text = msg.get("text", "") + await _file_annotations(msg)
         ts = msg.get("ts", "")
         lines.append(f"[{ts}] {user}: {text}")
     return [types.TextContent(type="text", text="\n".join(lines) or "No replies.")]
@@ -502,6 +504,80 @@ async def _handle_debug(args: dict) -> list[types.TextContent]:
 # ---------------------------------------------------------------------------
 # User name resolution (cached)
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# File attachments → local cache so agents can view images on demand
+# ---------------------------------------------------------------------------
+# Images are downloaded to a durable cache dir (NOT /tmp, which macOS prunes)
+# and referenced by absolute path in the message text. The agent's own Read
+# tool loads them only when it actually wants to look — so image bytes never
+# bloat context on a routine history read. Requires the user token's files:read
+# scope; url_private downloads need an authenticated request.
+_IMAGE_CACHE_DIR = Path(
+    os.environ.get("SLACK_IMAGE_CACHE_DIR")
+    or (Path.home() / ".cache" / "golem-slack-images")
+)
+
+
+def _safe_filename(file_id: str, name: str) -> str:
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", name or "file")
+    return f"{file_id or 'file'}_{base}"
+
+
+async def _download_slack_file(url: str) -> bytes | None:
+    """Fetch a Slack url_private with the read token, off the event loop.
+
+    Returns None on error, or when Slack serves its HTML sign-in page instead
+    of the file (what happens when the token can't access the file).
+    """
+    token = getattr(_read_client, "token", None)
+
+    def _get() -> bytes | None:
+        req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            ctype = resp.headers.get("Content-Type", "") or ""
+            data = resp.read()
+        if ctype.startswith("text/html"):
+            return None
+        return data
+
+    try:
+        return await anyio.to_thread.run_sync(_get)
+    except Exception:
+        logger.warning("Failed to download Slack file: %s", url, exc_info=True)
+        return None
+
+
+async def _file_annotations(msg: dict) -> str:
+    """Newline-prefixed annotations for any files attached to a message.
+
+    Images are cached locally and referenced by absolute path so the agent can
+    Read them on demand; other files are noted by name so the agent at least
+    knows they exist. Returns "" when the message has no files.
+    """
+    files = msg.get("files") or []
+    if not files:
+        return ""
+    lines: list[str] = []
+    for f in files:
+        name = f.get("name") or f.get("title") or "file"
+        mimetype = f.get("mimetype", "") or ""
+        if mimetype.startswith("image/"):
+            path = _IMAGE_CACHE_DIR / _safe_filename(f.get("id", ""), name)
+            if not (path.exists() and path.stat().st_size > 0):
+                url = f.get("url_private_download") or f.get("url_private")
+                data = await _download_slack_file(url) if url else None
+                if data:
+                    _IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(data)
+                else:
+                    lines.append(f"[image: {name} · download failed]")
+                    continue
+            lines.append(f"[image: {name} · path={path}]")
+        else:
+            lines.append(f"[file: {name} ({mimetype or 'unknown type'})]")
+    return ("\n" + "\n".join(lines)) if lines else ""
+
 
 async def _resolve_user(user_id: str) -> str:
     if not user_id:
@@ -586,7 +662,7 @@ async def _fetch_thread_context(channel: str, thread_ts: str) -> str:
     lines = []
     for msg in result.get("messages", []):
         user = await _resolve_user(msg.get("user", ""))
-        text = msg.get("text", "")
+        text = msg.get("text", "") + await _file_annotations(msg)
         lines.append(f"{user}: {text}")
     return "\n".join(lines)
 
