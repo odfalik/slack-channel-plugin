@@ -506,18 +506,35 @@ async def _handle_debug(args: dict) -> list[types.TextContent]:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# File attachments → local cache so agents can view images on demand
+# File attachments → local cache so agents can open them on demand
 # ---------------------------------------------------------------------------
-# Images are downloaded to a temp cache dir and referenced by absolute path in
-# the message text. The agent's own Read tool loads them only when it actually
-# wants to look — so image bytes never bloat context on a routine history read.
-# We use /tmp and don't manage retention: if the OS prunes an old file, a later
-# read just re-downloads it (fetch is keyed on cache-miss), so stale paths
-# self-heal. Requires the user token's files:read scope; url_private downloads
-# need an authenticated request.
-_IMAGE_CACHE_DIR = Path(
-    os.environ.get("SLACK_IMAGE_CACHE_DIR") or "/tmp/golem-slack-images"
+# Every attached file — images, PDFs, CSVs, whatever — is downloaded to a temp
+# cache dir and referenced by absolute path in the message text. The agent's own
+# Read tool loads it only when it actually wants to look — so file bytes never
+# bloat context on a routine history read. We use /tmp and don't manage
+# retention: if the OS prunes an old file, a later read just re-downloads it
+# (fetch is keyed on cache-miss), so stale paths self-heal. Requires the read
+# token's files:read scope; url_private downloads need an authenticated request.
+_FILE_CACHE_DIR = Path(
+    os.environ.get("SLACK_FILE_CACHE_DIR")
+    or os.environ.get("SLACK_IMAGE_CACHE_DIR")  # back-compat with the images-only name
+    or "/tmp/golem-slack-files"
 )
+
+# Don't eagerly download anything bigger than this (bytes) — a huge attachment
+# would stall a routine history read. Oversized files are still noted by name +
+# size so the agent knows they exist. Override via SLACK_MAX_DOWNLOAD_BYTES.
+_MAX_DOWNLOAD_BYTES = int(
+    os.environ.get("SLACK_MAX_DOWNLOAD_BYTES") or 100 * 1024 * 1024  # 100 MB
+)
+
+
+def _human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}GB"
 
 
 def _safe_filename(file_id: str, name: str) -> str:
@@ -552,9 +569,10 @@ async def _download_slack_file(url: str) -> bytes | None:
 async def _file_annotations(msg: dict) -> str:
     """Newline-prefixed annotations for any files attached to a message.
 
-    Images are cached locally and referenced by absolute path so the agent can
-    Read them on demand; other files are noted by name so the agent at least
-    knows they exist. Returns "" when the message has no files.
+    Every attached file — images, PDFs, CSVs, etc. — is cached locally and
+    referenced by absolute path so the agent can open it on demand; the agent's
+    Read tool handles images/PDFs/text alike. Oversized files are noted by name
+    and size instead of downloaded. Returns "" when the message has no files.
     """
     files = msg.get("files") or []
     if not files:
@@ -563,20 +581,27 @@ async def _file_annotations(msg: dict) -> str:
     for f in files:
         name = f.get("name") or f.get("title") or "file"
         mimetype = f.get("mimetype", "") or ""
-        if mimetype.startswith("image/"):
-            path = _IMAGE_CACHE_DIR / _safe_filename(f.get("id", ""), name)
-            if not (path.exists() and path.stat().st_size > 0):
-                url = f.get("url_private_download") or f.get("url_private")
-                data = await _download_slack_file(url) if url else None
-                if data:
-                    _IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(data)
-                else:
-                    lines.append(f"[image: {name} · download failed]")
-                    continue
-            lines.append(f"[image: {name} · path={path}]")
-        else:
-            lines.append(f"[file: {name} ({mimetype or 'unknown type'})]")
+        # Label images plainly; tag other files with their type so the agent
+        # knows what it's opening.
+        kind = "image" if mimetype.startswith("image/") else "file"
+        label = name if kind == "image" else f"{name} ({mimetype or 'unknown type'})"
+
+        size = f.get("size") or 0
+        if size and size > _MAX_DOWNLOAD_BYTES:
+            lines.append(f"[{kind}: {label} · {_human_size(size)}, too large to auto-download]")
+            continue
+
+        path = _FILE_CACHE_DIR / _safe_filename(f.get("id", ""), name)
+        if not (path.exists() and path.stat().st_size > 0):
+            url = f.get("url_private_download") or f.get("url_private")
+            data = await _download_slack_file(url) if url else None
+            if data:
+                _FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(data)
+            else:
+                lines.append(f"[{kind}: {label} · download failed]")
+                continue
+        lines.append(f"[{kind}: {label} · path={path}]")
     return ("\n" + "\n".join(lines)) if lines else ""
 
 
