@@ -329,6 +329,24 @@ async def list_tools() -> list[types.Tool]:
             },
         ),
         types.Tool(
+            name="fetch_file",
+            description=(
+                "Download a file attached to a Slack message and return a local path to Read. "
+                "Works for any attachment — images, PDFs, CSVs, etc. Pass the file id shown in "
+                "message annotations as '[... · fetch_file id=Fxxxx]'."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_id": {
+                        "type": "string",
+                        "description": "Slack file id (e.g. F0BGSTS7HKJ), from a message's fetch_file annotation.",
+                    },
+                },
+                "required": ["file_id"],
+            },
+        ),
+        types.Tool(
             name="debug",
             description="Show internal plugin state (owned threads, leader status, etc.)",
             inputSchema={"type": "object", "properties": {}},
@@ -348,6 +366,7 @@ async def call_tool(
         "list_channels": _handle_list_channels,
         "read_history": _handle_read_history,
         "get_thread": _handle_get_thread,
+        "fetch_file": _handle_fetch_file,
         "debug": _handle_debug,
     }
     handler = handlers.get(name)
@@ -451,7 +470,7 @@ async def _handle_read_history(args: dict) -> list[types.TextContent]:
     for msg in reversed(result.get("messages", [])):
         user = await _resolve_user(msg.get("user", ""))
         ts = msg.get("ts", "")
-        text = msg.get("text", "") + await _file_annotations(msg)
+        text = msg.get("text", "") + _file_annotations(msg)
         thread_indicator = ""
         if msg.get("reply_count"):
             thread_indicator = f" [{msg['reply_count']} replies]"
@@ -469,7 +488,7 @@ async def _handle_get_thread(args: dict) -> list[types.TextContent]:
     lines = []
     for msg in result.get("messages", []):
         user = await _resolve_user(msg.get("user", ""))
-        text = msg.get("text", "") + await _file_annotations(msg)
+        text = msg.get("text", "") + _file_annotations(msg)
         ts = msg.get("ts", "")
         lines.append(f"[{ts}] {user}: {text}")
     return [types.TextContent(type="text", text="\n".join(lines) or "No replies.")]
@@ -506,18 +525,30 @@ async def _handle_debug(args: dict) -> list[types.TextContent]:
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# File attachments → local cache so agents can view images on demand
+# File attachments → on-demand download via the fetch_file tool
 # ---------------------------------------------------------------------------
-# Images are downloaded to a temp cache dir and referenced by absolute path in
-# the message text. The agent's own Read tool loads them only when it actually
-# wants to look — so image bytes never bloat context on a routine history read.
-# We use /tmp and don't manage retention: if the OS prunes an old file, a later
-# read just re-downloads it (fetch is keyed on cache-miss), so stale paths
-# self-heal. Requires the user token's files:read scope; url_private downloads
-# need an authenticated request.
-_IMAGE_CACHE_DIR = Path(
-    os.environ.get("SLACK_IMAGE_CACHE_DIR") or "/tmp/golem-slack-images"
+# Message renders never download anything. Each attached file (image, PDF, CSV,
+# whatever) is annotated inline with its Slack file id, name, type, and size, so
+# the agent sees what's there without any bytes hitting disk or context. When it
+# actually wants a file, it calls the fetch_file tool with that id: the file is
+# downloaded to a temp cache dir and its absolute path returned, which the agent
+# then opens with its own Read tool. We use /tmp and don't manage retention: if
+# the OS prunes a cached file, the next fetch_file just re-downloads it (keyed on
+# cache-miss), so paths self-heal. Requires the read token's files:read scope;
+# url_private downloads need an authenticated request.
+_FILE_CACHE_DIR = Path(
+    os.environ.get("SLACK_FILE_CACHE_DIR")
+    or os.environ.get("SLACK_IMAGE_CACHE_DIR")  # back-compat with the images-only name
+    or "/tmp/golem-slack-files"
 )
+
+
+def _human_size(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f}{unit}"
+        n /= 1024
+    return f"{n:.0f}GB"
 
 
 def _safe_filename(file_id: str, name: str) -> str:
@@ -549,12 +580,12 @@ async def _download_slack_file(url: str) -> bytes | None:
         return None
 
 
-async def _file_annotations(msg: dict) -> str:
-    """Newline-prefixed annotations for any files attached to a message.
+def _file_annotations(msg: dict) -> str:
+    """Newline-prefixed notes for any files attached to a message.
 
-    Images are cached locally and referenced by absolute path so the agent can
-    Read them on demand; other files are noted by name so the agent at least
-    knows they exist. Returns "" when the message has no files.
+    Purely descriptive — no download. Each file is listed with its type, size,
+    and Slack id so the agent can pull it on demand via fetch_file. Returns ""
+    when the message has no files.
     """
     files = msg.get("files") or []
     if not files:
@@ -563,21 +594,55 @@ async def _file_annotations(msg: dict) -> str:
     for f in files:
         name = f.get("name") or f.get("title") or "file"
         mimetype = f.get("mimetype", "") or ""
-        if mimetype.startswith("image/"):
-            path = _IMAGE_CACHE_DIR / _safe_filename(f.get("id", ""), name)
-            if not (path.exists() and path.stat().st_size > 0):
-                url = f.get("url_private_download") or f.get("url_private")
-                data = await _download_slack_file(url) if url else None
-                if data:
-                    _IMAGE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(data)
-                else:
-                    lines.append(f"[image: {name} · download failed]")
-                    continue
-            lines.append(f"[image: {name} · path={path}]")
-        else:
-            lines.append(f"[file: {name} ({mimetype or 'unknown type'})]")
+        kind = "image" if mimetype.startswith("image/") else "file"
+        meta = mimetype or "unknown type"
+        size = f.get("size") or 0
+        if size:
+            meta += f", {_human_size(size)}"
+        file_id = f.get("id", "") or "?"
+        lines.append(f"[{kind}: {name} ({meta}) · fetch_file id={file_id}]")
     return ("\n" + "\n".join(lines)) if lines else ""
+
+
+async def _handle_fetch_file(args: dict) -> list[types.TextContent]:
+    """Download a Slack file by id and return its local path for Read.
+
+    Works for any attachment type — images, PDFs, CSVs, etc. Cache-hit returns
+    the existing path without re-downloading.
+    """
+    file_id = (args.get("file_id") or "").strip()
+    if not file_id:
+        return [types.TextContent(type="text", text="Error: file_id is required.")]
+
+    # Resolve the file's name + private URL from Slack (needs files:read).
+    try:
+        info = await _read_client.files_info(file=file_id)
+        f = info["file"]
+    except Exception as e:
+        return [types.TextContent(type="text", text=f"Error: could not look up file {file_id}: {e}")]
+
+    name = f.get("name") or f.get("title") or "file"
+    path = _FILE_CACHE_DIR / _safe_filename(file_id, name)
+
+    # Cache hit — reuse.
+    if path.exists() and path.stat().st_size > 0:
+        return [types.TextContent(type="text", text=f"path={path}")]
+
+    url = f.get("url_private_download") or f.get("url_private")
+    data = await _download_slack_file(url) if url else None
+    if not data:
+        return [types.TextContent(
+            type="text",
+            text=f"Error: download failed for {name} (id={file_id}). "
+                 "The read token may lack files:read or access to this file.",
+        )]
+
+    _FILE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return [types.TextContent(
+        type="text",
+        text=f"Downloaded {name} ({_human_size(len(data))}). Read it at:\npath={path}",
+    )]
 
 
 async def _resolve_user(user_id: str) -> str:
@@ -663,7 +728,7 @@ async def _fetch_thread_context(channel: str, thread_ts: str) -> str:
     lines = []
     for msg in result.get("messages", []):
         user = await _resolve_user(msg.get("user", ""))
-        text = msg.get("text", "") + await _file_annotations(msg)
+        text = msg.get("text", "") + _file_annotations(msg)
         lines.append(f"{user}: {text}")
     return "\n".join(lines)
 
