@@ -86,6 +86,21 @@ claude --dangerously-load-development-channels server:slack-channel
 | `read_history` | Read channel message history |
 | `get_thread` | Get thread replies |
 
+### Human channel references
+
+Tools that take a `channel` argument accept human-readable references as well as Slack IDs:
+
+| Input form | Example |
+|------------|---------|
+| Channel label | `#engineering` |
+| Channel name | `engineering` |
+| DM label | `@Yue` |
+| Person name | `Yue` |
+| Distinctive DM/group-DM substring | `yufan` |
+| Slack ID | `C0AAWT14XT4` |
+
+Prefer names in agent workflows. `list_channels` now prints copyable `use channel="..."` labels; IDs are still included for debugging.
+
 ## Architecture
 
 - **Single Socket Mode connection** — leader election via lock file prevents duplicate event delivery
