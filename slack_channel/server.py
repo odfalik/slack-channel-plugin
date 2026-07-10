@@ -26,16 +26,15 @@ from pathlib import Path
 from typing import Any
 
 import anyio
-from dotenv import load_dotenv
-from slack_bolt.async_app import AsyncApp
-from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
-
 import mcp.types as types
+from dotenv import load_dotenv
 from mcp.server.lowlevel.server import NotificationOptions, Server
 from mcp.server.models import InitializationOptions
 from mcp.server.session import ServerSession
 from mcp.server.stdio import stdio_server
 from mcp.shared.message import SessionMessage
+from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+from slack_bolt.async_app import AsyncApp
 
 # Load env vars. Priority: real env vars > plugin channels dir > local .env
 # The channels dir (~/.claude/channels/slack-channel/.env) is the standard
@@ -59,6 +58,7 @@ _pending_eyes: dict[str, str] = {}  # thread_ts → message_ts (messages with ey
 _user_name_cache: dict[str, str] = {}
 
 CHANNEL_ID = os.environ.get("SLACK_CHANNEL_ID", "")
+_SLACK_CHANNEL_ID_RE = re.compile(r"^[CDG][A-Z0-9]+$")
 
 # Shared state directory
 _STATE_DIR = Path(
@@ -235,6 +235,124 @@ def _append_event(event: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Channel/DM name resolution
+# ---------------------------------------------------------------------------
+
+def _clean_channel_ref(channel: str) -> str:
+    value = channel.strip()
+    channel_link = re.fullmatch(r"<#([A-Z0-9]+)(?:\|[^>]+)?>", value)
+    if channel_link:
+        return channel_link.group(1)
+    user_mention = re.fullmatch(r"<@([A-Z0-9]+)(?:\|[^>]+)?>", value)
+    if user_mention:
+        return user_mention.group(1)
+    return value
+
+
+def _normalize_lookup(value: str) -> str:
+    value = value.strip().lower().lstrip("#@")
+    return re.sub(r"[^a-z0-9]+", "", value)
+
+
+def _is_channel_id(channel: str) -> bool:
+    return bool(_SLACK_CHANNEL_ID_RE.fullmatch(channel))
+
+
+async def _list_conversations_for_resolution(limit: int = 1000) -> list[dict]:
+    conversations: list[dict] = []
+    cursor: str | None = None
+    while len(conversations) < limit:
+        kwargs: dict[str, Any] = {
+            "types": "public_channel,private_channel,mpim,im",
+            "exclude_archived": True,
+            "limit": min(200, limit - len(conversations)),
+        }
+        if cursor:
+            kwargs["cursor"] = cursor
+        result = await _read_client.conversations_list(**kwargs)
+        conversations.extend(result.get("channels", []))
+        cursor = result.get("response_metadata", {}).get("next_cursor") or None
+        if not cursor:
+            break
+    return conversations
+
+
+async def _conversation_label(ch: dict) -> tuple[str, str]:
+    if ch.get("is_im"):
+        peer = await _resolve_user(ch.get("user", ""))
+        return f"@{peer}", "DM"
+    name = ch.get("name") or ch.get("id", "?")
+    if ch.get("is_mpim"):
+        return f"#{name}", "group DM"
+    return f"#{name}", f"{ch.get('num_members', '?')} members"
+
+
+async def _conversation_terms(ch: dict) -> tuple[str, list[str]]:
+    label, _ = await _conversation_label(ch)
+    terms = [ch.get("id", ""), label, label.lstrip("#@")]
+    if ch.get("name"):
+        terms.extend([ch["name"], f"#{ch['name']}"])
+    if ch.get("is_im") and ch.get("user"):
+        user_id = ch["user"]
+        terms.append(user_id)
+        terms.append(f"@{user_id}")
+    return label, terms
+
+
+async def _resolve_channel_ref(channel: str) -> str:
+    """Resolve a human Slack channel reference to a conversation ID.
+
+    Accepts Slack conversation IDs plus human forms such as "#general",
+    "general", "@Yue", "Yue", "yufan", or an exact group-DM label. A single
+    distinctive substring is allowed so requests like "check my DMs with yufan"
+    can succeed without forcing the agent to copy opaque IDs.
+    """
+    query = _clean_channel_ref(channel)
+    if not query:
+        raise ValueError("channel is required")
+    if _is_channel_id(query):
+        return query
+
+    query_norm = _normalize_lookup(query)
+    if not query_norm:
+        raise ValueError(f"Channel not found: {channel!r}")
+
+    exact_matches: list[tuple[str, str]] = []
+    fuzzy_matches: list[tuple[str, str]] = []
+
+    for ch in await _list_conversations_for_resolution():
+        cid = ch.get("id", "")
+        label, terms = await _conversation_terms(ch)
+        normalized_terms = {_normalize_lookup(term) for term in terms if term}
+        if query_norm in normalized_terms:
+            exact_matches.append((cid, label))
+        elif any(query_norm in term for term in normalized_terms):
+            fuzzy_matches.append((cid, label))
+
+    matches = exact_matches or fuzzy_matches
+    if not matches:
+        raise ValueError(
+            f"Channel or DM not found for {channel!r}. Try list_channels, then pass "
+            "the shown #channel/@user label."
+        )
+
+    # Deduplicate aliases that pointed at the same conversation.
+    deduped: dict[str, str] = {}
+    for cid, label in matches:
+        deduped.setdefault(cid, label)
+    matches = list(deduped.items())
+
+    if len(matches) == 1:
+        return matches[0][0]
+
+    labels = ", ".join(f"{label} ({cid})" for cid, label in matches[:8])
+    extra = "" if len(matches) <= 8 else f", and {len(matches) - 8} more"
+    raise ValueError(
+        f"Ambiguous channel or DM {channel!r}. Retry with one of: {labels}{extra}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # MCP server (low-level for full control over the run loop)
 # ---------------------------------------------------------------------------
 server = Server("slack-channel")
@@ -245,14 +363,18 @@ async def list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="reply",
-            description="Send a message to a Slack channel or thread",
+            description="Send a message to a Slack channel, DM, group DM, or thread",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Message text (supports Slack mrkdwn)"},
                     "channel": {
                         "type": "string",
-                        "description": "Channel ID. Defaults to SLACK_CHANNEL_ID env var.",
+                        "description": (
+                            "Channel/DM name or ID. Prefer human names: #general, general, "
+                            "@Yue, Yue, yufan, or an exact group-DM label. "
+                            "Defaults to SLACK_CHANNEL_ID env var."
+                        ),
                     },
                     "thread_ts": {
                         "type": "string",
@@ -268,7 +390,10 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string", "description": "Channel ID"},
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel/DM name or ID. Prefer names like #general, @Yue, or yufan.",
+                    },
                     "timestamp": {"type": "string", "description": "Message timestamp"},
                     "reaction": {
                         "type": "string",
@@ -284,7 +409,10 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string", "description": "Channel ID"},
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel/DM name or ID. Prefer names like #general, @Yue, or yufan.",
+                    },
                     "timestamp": {"type": "string", "description": "Message timestamp"},
                     "reaction": {
                         "type": "string",
@@ -296,7 +424,11 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="list_channels",
-            description="List Slack channels and DMs (public/private channels, group DMs, and direct messages). DMs appear as '@user  <id>  (DM)'.",
+            description=(
+                "List Slack channels and DMs. Use the shown #channel/@user label, "
+                "or a distinctive person/name substring, with read_history/reply/get_thread. "
+                "Slack IDs are included only for debugging."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -306,11 +438,18 @@ async def list_tools() -> list[types.Tool]:
         ),
         types.Tool(
             name="read_history",
-            description="Read recent messages from a Slack channel",
+            description=(
+                "Read recent messages from a Slack channel, DM, or group DM. "
+                "The channel field accepts names such as #general, general, @Yue, Yue, "
+                "yufan, exact group-DM labels, or Slack IDs. Prefer names."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string", "description": "Channel ID"},
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel/DM name or ID. Prefer names like #general, @Yue, or yufan.",
+                    },
                     "limit": {"type": "integer", "description": "Max messages (default 25)"},
                 },
                 "required": ["channel"],
@@ -322,7 +461,10 @@ async def list_tools() -> list[types.Tool]:
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "channel": {"type": "string", "description": "Channel ID"},
+                    "channel": {
+                        "type": "string",
+                        "description": "Channel/DM name or ID. Prefer names like #general, @Yue, or yufan.",
+                    },
                     "thread_ts": {"type": "string", "description": "Thread timestamp"},
                 },
                 "required": ["channel", "thread_ts"],
@@ -380,9 +522,13 @@ async def call_tool(
 # ---------------------------------------------------------------------------
 
 async def _handle_reply(args: dict) -> list[types.TextContent]:
-    channel = args.get("channel") or CHANNEL_ID
-    if not channel:
+    channel_arg = args.get("channel") or CHANNEL_ID
+    if not channel_arg:
         return [types.TextContent(type="text", text="Error: no channel — set SLACK_CHANNEL_ID or pass channel")]
+    try:
+        channel = await _resolve_channel_ref(channel_arg)
+    except ValueError as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
 
     # Prefix message with tmux window name if available (so recipients
     # know which agent/session sent the message).
@@ -421,8 +567,12 @@ async def _handle_reply(args: dict) -> list[types.TextContent]:
 
 
 async def _handle_add_reaction(args: dict) -> list[types.TextContent]:
+    try:
+        channel = await _resolve_channel_ref(args["channel"])
+    except ValueError as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
     await _slack_client.reactions_add(
-        channel=args["channel"],
+        channel=channel,
         timestamp=args["timestamp"],
         name=args["reaction"],
     )
@@ -431,8 +581,12 @@ async def _handle_add_reaction(args: dict) -> list[types.TextContent]:
 
 async def _handle_remove_reaction(args: dict) -> list[types.TextContent]:
     try:
+        channel = await _resolve_channel_ref(args["channel"])
+    except ValueError as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
+    try:
         await _slack_client.reactions_remove(
-            channel=args["channel"],
+            channel=channel,
             timestamp=args["timestamp"],
             name=args["reaction"],
         )
@@ -443,26 +597,19 @@ async def _handle_remove_reaction(args: dict) -> list[types.TextContent]:
 
 async def _handle_list_channels(args: dict) -> list[types.TextContent]:
     limit = args.get("limit", 100)
-    result = await _read_client.conversations_list(
-        types="public_channel,private_channel,mpim,im",
-        exclude_archived=True,
-        limit=limit,
-    )
     lines = []
-    for ch in result.get("channels", []):
+    for ch in await _list_conversations_for_resolution(limit=limit):
         cid = ch["id"]
-        if ch.get("is_im"):
-            peer = await _resolve_user(ch.get("user", ""))
-            lines.append(f"@{peer}  {cid}  (DM)")
-        else:
-            name = ch.get("name", "?")
-            members = ch.get("num_members", "?")
-            lines.append(f"#{name}  {cid}  ({members} members)")
+        label, detail = await _conversation_label(ch)
+        lines.append(f'{label}  id={cid}  ({detail})  use channel="{label}"')
     return [types.TextContent(type="text", text="\n".join(lines) or "No channels found.")]
 
 
 async def _handle_read_history(args: dict) -> list[types.TextContent]:
-    channel = args["channel"]
+    try:
+        channel = await _resolve_channel_ref(args["channel"])
+    except ValueError as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
     limit = args.get("limit", 25)
     result = await _read_client.conversations_history(channel=channel, limit=limit)
 
@@ -479,7 +626,10 @@ async def _handle_read_history(args: dict) -> list[types.TextContent]:
 
 
 async def _handle_get_thread(args: dict) -> list[types.TextContent]:
-    channel = args["channel"]
+    try:
+        channel = await _resolve_channel_ref(args["channel"])
+    except ValueError as e:
+        return [types.TextContent(type="text", text=f"Error: {e}")]
     thread_ts = args["thread_ts"]
     result = await _read_client.conversations_replies(
         channel=channel, ts=thread_ts, limit=200,
